@@ -326,7 +326,7 @@ impl<'a, D: DBAccess> DBRawIteratorWithThreadMode<'a, D> {
     }
 
     /// Returns a slice of the current key.
-    pub fn key(&self) -> Option<&[u8]> {
+    pub fn key(&self) -> Option<&'a [u8]> {
         if self.valid() {
             Some(self.key_impl())
         } else {
@@ -335,7 +335,7 @@ impl<'a, D: DBAccess> DBRawIteratorWithThreadMode<'a, D> {
     }
 
     /// Returns a slice of the current value.
-    pub fn value(&self) -> Option<&[u8]> {
+    pub fn value(&self) -> Option<&'a [u8]> {
         if self.valid() {
             Some(self.value_impl())
         } else {
@@ -344,7 +344,7 @@ impl<'a, D: DBAccess> DBRawIteratorWithThreadMode<'a, D> {
     }
 
     /// Returns pair with slice of the current key and current value.
-    pub fn item(&self) -> Option<(&[u8], &[u8])> {
+    pub fn item(&self) -> Option<(&'a [u8], &'a [u8])> {
         if self.valid() {
             Some((self.key_impl(), self.value_impl()))
         } else {
@@ -353,7 +353,7 @@ impl<'a, D: DBAccess> DBRawIteratorWithThreadMode<'a, D> {
     }
 
     /// Returns a slice of the current key; assumes the iterator is valid.
-    fn key_impl(&self) -> &[u8] {
+    fn key_impl(&self) -> &'a [u8] {
         // Safety Note: This is safe as all methods that may invalidate the buffer returned
         // take `&mut self`, so borrow checker will prevent use of buffer after seek.
         unsafe {
@@ -365,7 +365,7 @@ impl<'a, D: DBAccess> DBRawIteratorWithThreadMode<'a, D> {
     }
 
     /// Returns a slice of the current value; assumes the iterator is valid.
-    fn value_impl(&self) -> &[u8] {
+    fn value_impl(&self) -> &'a [u8] {
         // Safety Note: This is safe as all methods that may invalidate the buffer returned
         // take `&mut self`, so borrow checker will prevent use of buffer after seek.
         unsafe {
@@ -390,6 +390,107 @@ unsafe impl<D: DBAccess> Sync for DBRawIteratorWithThreadMode<'_, D> {}
 
 /// A type alias to keep compatibility. See [`DBIteratorWithThreadMode`] for details
 pub type DBIterator<'a> = DBIteratorWithThreadMode<'a, DB>;
+
+/// An iterator over a database or column family, with specifiable
+/// ranges and direction.
+///
+/// This iterator is different to the standard ``DBIteratorWithThreadMode`` as it returns
+/// references to the keys and values instead of cloning them.
+pub struct DBRefIteratorWithThreadMode<'a, D: DBAccess> {
+    raw: DBRawIteratorWithThreadMode<'a, D>,
+    direction: Direction,
+    state: State,
+}
+
+#[derive(Copy, Clone)]
+enum State {
+    First,
+    Iterating,
+    Done,
+}
+
+#[derive(Copy, Clone)]
+pub enum Direction {
+    Forward,
+    Reverse,
+}
+
+pub type KVBytesRef<'a> = (&'a [u8], &'a [u8]);
+
+#[derive(Copy, Clone)]
+pub enum IteratorMode<'a> {
+    Start,
+    End,
+    From(&'a [u8], Direction),
+}
+
+impl<'a, D: DBAccess> DBRefIteratorWithThreadMode<'a, D> {
+    fn from_raw(raw: DBRawIteratorWithThreadMode<'a, D>, mode: IteratorMode) -> Self {
+        let mut rv = DBRefIteratorWithThreadMode {
+            raw,
+            direction: Direction::Forward, // blown away by set_mode()
+            state: State::First,
+        };
+        rv.set_mode(mode);
+        rv
+    }
+
+    pub fn set_mode(&mut self, mode: IteratorMode) {
+        self.state = State::First;
+        self.direction = match mode {
+            IteratorMode::Start => {
+                self.raw.seek_to_first();
+                Direction::Forward
+            }
+            IteratorMode::End => {
+                self.raw.seek_to_last();
+                Direction::Reverse
+            }
+            IteratorMode::From(key, Direction::Forward) => {
+                self.raw.seek(key);
+                Direction::Forward
+            }
+            IteratorMode::From(key, Direction::Reverse) => {
+                self.raw.seek_for_prev(key);
+                Direction::Reverse
+            }
+        };
+    }
+}
+
+impl<'a, D: DBAccess> Iterator for DBRefIteratorWithThreadMode<'a, D> {
+    type Item = Result<KVBytesRef<'a>, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.state {
+            State::First => {
+                self.state = State::Iterating;
+            }
+            State::Iterating => match self.direction {
+                Direction::Forward => self.raw.next(),
+                Direction::Reverse => self.raw.prev(),
+            },
+            State::Done => return None,
+        }
+
+        if let Some(item) = self.raw.item() {
+            Some(Ok(item))
+        } else {
+            self.state = State::Done;
+            self.raw.status().err().map(Result::Err)
+        }
+    }
+}
+
+impl<D: DBAccess> std::iter::FusedIterator for DBRefIteratorWithThreadMode<'_, D> {}
+
+impl<'a, D: DBAccess> Into<DBRawIteratorWithThreadMode<'a, D>>
+    for DBRefIteratorWithThreadMode<'a, D>
+{
+    fn into(self) -> DBRawIteratorWithThreadMode<'a, D> {
+        self.raw
+    }
+}
 
 /// An iterator over a database or column family, with specifiable
 /// ranges and direction.
@@ -431,29 +532,18 @@ pub type DBIterator<'a> = DBIteratorWithThreadMode<'a, DB>;
 /// let _ = DB::destroy(&Options::default(), path);
 /// ```
 pub struct DBIteratorWithThreadMode<'a, D: DBAccess> {
-    raw: DBRawIteratorWithThreadMode<'a, D>,
-    direction: Direction,
-    done: bool,
-}
-
-#[derive(Copy, Clone)]
-pub enum Direction {
-    Forward,
-    Reverse,
+    ref_iter: DBRefIteratorWithThreadMode<'a, D>,
 }
 
 pub type KVBytes = (Box<[u8]>, Box<[u8]>);
 
-#[derive(Copy, Clone)]
-pub enum IteratorMode<'a> {
-    Start,
-    End,
-    From(&'a [u8], Direction),
-}
-
 impl<'a, D: DBAccess> DBIteratorWithThreadMode<'a, D> {
     pub(crate) fn new(db: &D, readopts: ReadOptions, mode: IteratorMode) -> Self {
-        Self::from_raw(DBRawIteratorWithThreadMode::new(db, readopts), mode)
+        let ref_iter = DBRefIteratorWithThreadMode::from_raw(
+            DBRawIteratorWithThreadMode::new(db, readopts),
+            mode,
+        );
+        Self { ref_iter }
     }
 
     pub(crate) fn new_cf(
@@ -462,62 +552,25 @@ impl<'a, D: DBAccess> DBIteratorWithThreadMode<'a, D> {
         readopts: ReadOptions,
         mode: IteratorMode,
     ) -> Self {
-        Self::from_raw(
+        let ref_iter = DBRefIteratorWithThreadMode::from_raw(
             DBRawIteratorWithThreadMode::new_cf(db, cf_handle, readopts),
             mode,
-        )
-    }
-
-    fn from_raw(raw: DBRawIteratorWithThreadMode<'a, D>, mode: IteratorMode) -> Self {
-        let mut rv = DBIteratorWithThreadMode {
-            raw,
-            direction: Direction::Forward, // blown away by set_mode()
-            done: false,
-        };
-        rv.set_mode(mode);
-        rv
+        );
+        Self { ref_iter }
     }
 
     pub fn set_mode(&mut self, mode: IteratorMode) {
-        self.done = false;
-        self.direction = match mode {
-            IteratorMode::Start => {
-                self.raw.seek_to_first();
-                Direction::Forward
-            }
-            IteratorMode::End => {
-                self.raw.seek_to_last();
-                Direction::Reverse
-            }
-            IteratorMode::From(key, Direction::Forward) => {
-                self.raw.seek(key);
-                Direction::Forward
-            }
-            IteratorMode::From(key, Direction::Reverse) => {
-                self.raw.seek_for_prev(key);
-                Direction::Reverse
-            }
-        };
+        self.ref_iter.set_mode(mode);
     }
 }
 
-impl<D: DBAccess> Iterator for DBIteratorWithThreadMode<'_, D> {
+impl<'a, D: DBAccess> Iterator for DBIteratorWithThreadMode<'a, D> {
     type Item = Result<KVBytes, Error>;
 
-    fn next(&mut self) -> Option<Result<KVBytes, Error>> {
-        if self.done {
-            None
-        } else if let Some((key, value)) = self.raw.item() {
-            let item = (Box::from(key), Box::from(value));
-            match self.direction {
-                Direction::Forward => self.raw.next(),
-                Direction::Reverse => self.raw.prev(),
-            }
-            Some(Ok(item))
-        } else {
-            self.done = true;
-            self.raw.status().err().map(Result::Err)
-        }
+    fn next(&mut self) -> Option<Self::Item> {
+        self.ref_iter
+            .next()
+            .map(|item| item.map(|(key, value)| (Box::from(key), Box::from(value))))
     }
 }
 
@@ -525,7 +578,7 @@ impl<D: DBAccess> std::iter::FusedIterator for DBIteratorWithThreadMode<'_, D> {
 
 impl<'a, D: DBAccess> Into<DBRawIteratorWithThreadMode<'a, D>> for DBIteratorWithThreadMode<'a, D> {
     fn into(self) -> DBRawIteratorWithThreadMode<'a, D> {
-        self.raw
+        self.ref_iter.into()
     }
 }
 
